@@ -1,0 +1,165 @@
+name: Build and Deploy to Azure Container Registry
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'DocumentTranslation.Web/**'
+      - 'DocumentTranslationService/**'
+      - 'Dockerfile'
+      - '.github/workflows/docker-build-deploy.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'DocumentTranslation.Web/**'
+      - 'DocumentTranslationService/**'
+      - 'Dockerfile'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY_NAME: ${{ secrets.ACR_REGISTRY_NAME }}
+  IMAGE_NAME: document-translation
+  RESOURCE_GROUP: ${{ secrets.ACR_RESOURCE_GROUP }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Log in to Azure Container Registry
+      uses: azure/docker-login@v1
+      with:
+        login-server: ${{ env.REGISTRY_NAME }}.azurecr.io
+        username: ${{ secrets.ACR_USERNAME }}
+        password: ${{ secrets.ACR_PASSWORD }}
+    
+    - name: Get version
+      id: version
+      run: |
+        # Generate version based on git commit and branch
+        SHORT_SHA=$(git rev-parse --short HEAD)
+        BRANCH_NAME=${GITHUB_REF#refs/heads/}
+        BRANCH_NAME=${BRANCH_NAME//\//-}
+        
+        if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+          VERSION="latest"
+          TAG_VERSION="v$(date +'%Y%m%d')-${SHORT_SHA}"
+        elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          VERSION="${{ github.event.inputs.environment }}-${SHORT_SHA}"
+          TAG_VERSION="${{ github.event.inputs.environment }}-v$(date +'%Y%m%d')-${SHORT_SHA}"
+        else
+          VERSION="${BRANCH_NAME}-${SHORT_SHA}"
+          TAG_VERSION="${BRANCH_NAME}-v$(date +'%Y%m%d')-${SHORT_SHA}"
+        fi
+        
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+        echo "tag_version=${TAG_VERSION}" >> $GITHUB_OUTPUT
+        echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+        echo "Build version: ${VERSION}"
+        echo "Tag version: ${TAG_VERSION}"
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: |
+          ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+          ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag_version }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64
+        build-args: |
+          BUILD_CONFIGURATION=Release
+          BUILDKIT_INLINE_CACHE=1
+    
+    - name: Run Docker image security scan
+      uses: azure/container-scan@v0
+      with:
+        image-name: ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+        severity-threshold: HIGH
+        run-quality-checks: true
+    
+    - name: Update deployment manifest (if exists)
+      if: github.ref == 'refs/heads/main'
+      run: |
+        if [ -f "infra/container-app.bicep" ]; then
+          echo "Updating container image reference in Bicep files..."
+          sed -i "s|image: '.*'|image: '${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}'|g" infra/container-app.bicep
+        fi
+        
+        if [ -f "azure.yaml" ]; then
+          echo "Container image built and pushed successfully!"
+          echo "Image: ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}"
+        fi
+    
+    - name: Azure logout
+      if: always()
+      run: az logout
+
+  deploy-to-staging:
+    if: github.ref == 'refs/heads/develop' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: staging
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Log in to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Deploy to Azure Container Apps (Staging)
+      if: github.event_name != 'pull_request'
+      run: |
+        echo "Deploying to staging environment..."
+        # Add your deployment commands here
+        # Example: az containerapp update --name app-staging --resource-group ${{ env.RESOURCE_GROUP }} --image ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:develop-${{ github.sha }}
+
+  deploy-to-production:
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Log in to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Deploy to Azure Container Apps (Production)
+      if: github.event_name != 'pull_request'
+      run: |
+        echo "Deploying to production environment..."
+        # Add your deployment commands here
+        # Example: az containerapp update --name app-production --resource-group ${{ env.RESOURCE_GROUP }} --image ${{ env.REGISTRY_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest
